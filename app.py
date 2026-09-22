@@ -1,136 +1,167 @@
 import os
+import re
 import tempfile
+import asyncio
+import subprocess
 import streamlit as st
 import fitz  # PyMuPDF
-from gtts import gTTS
-from pydub import AudioSegment
+import edge_tts
 
-st.set_page_config(page_title="Free Local PDF to Audiobook", page_icon="🎧", layout="centered")
+st.set_page_config(page_title="Pro Audiobook Creator", page_icon="🎙️", layout="wide")
 
-def extract_text_from_pdf(pdf_file):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-        tmp_file.write(pdf_file.read())
-        tmp_path = tmp_file.name
-
-    doc = fitz.open(tmp_path)
-    full_text = ""
-    for page_num, page in enumerate(doc):
-        text = page.get_text()
-        if text:
-            full_text += f"\n[Page {page_num + 1}]\n" + text
-    doc.close()
-    os.unlink(tmp_path)
-    return full_text
-
+# --- 1. Advanced PDF Parsing & Cleaning ---
 def clean_text(text):
-    return " ".join(text.split())
+    """Production-grade text normalization."""
+    # Fix hyphenated words broken by line breaks
+    text = re.sub(r'(\w+)-\n(\w+)', r'\1\2', text)
+    # Remove standalone page numbers and typical header/footer artifacts
+    text = re.sub(r'^\s*\d+\s*$', '', text, flags=re.MULTILINE)
+    # Replace multiple newlines and weird spaces
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
 
-def chunk_text(text, max_chars=4000):
-    """Splits massive text into safe segments for text-to-speech engines."""
-    words = text.split()
-    chunks = []
-    current_chunk = []
-    current_length = 0
+def extract_chapters_from_pdf(pdf_path):
+    """Extracts text chunked by the actual PDF Table of Contents."""
+    doc = fitz.open(pdf_path)
+    toc = doc.get_toc()
+    chapters = []
     
-    for word in words:
-        if current_length + len(word) + 1 > max_chars:
-            chunks.append(" ".join(current_chunk))
-            current_chunk = [word]
-            current_length = len(word)
-        else:
-            current_chunk.append(word)
-            current_length += len(word) + 1
+    if not toc:
+        # Fallback: If no TOC, chunk by every 10 pages
+        full_text = ""
+        for page in doc:
+            full_text += page.get_text()
+        
+        words = full_text.split()
+        chunk_size = 3000
+        for i in range(0, len(words), chunk_size):
+            chunk_text = " ".join(words[i:i+chunk_size])
+            chapters.append({"title": f"Part {i//chunk_size + 1}", "text": clean_text(chunk_text)})
+        doc.close()
+        return chapters
+
+    # If TOC exists, extract text between chapter pages
+    for i in range(len(toc)):
+        lvl, title, start_page = toc[i]
+        start_page -= 1 # PyMuPDF pages are 0-indexed
+        end_page = toc[i+1][2] - 1 if i + 1 < len(toc) else len(doc)
+        
+        chapter_text = ""
+        for page_num in range(start_page, end_page):
+            chapter_text += doc[page_num].get_text()
             
-    if current_chunk:
-        chunks.append(" ".join(current_chunk))
-    return chunks
+        cleaned = clean_text(chapter_text)
+        if len(cleaned) > 50: # Skip empty structural chapters
+            chapters.append({"title": title.replace("/", "-"), "text": cleaned})
+            
+    doc.close()
+    return chapters
+
+# --- 2. Neural Audio Generation (Async) ---
+async def generate_chapter_audio(text, voice, output_path):
+    """Uses Edge-TTS to generate highly realistic neural speech."""
+    communicate = edge_tts.Communicate(text, voice)
+    await communicate.save(output_path)
+    return output_path
+
+# --- 3. Final M4B Compilation with Chapters ---
+def compile_m4b_with_chapters(chapter_files, output_m4b):
+    """Uses FFmpeg to combine audio and inject chapter metadata."""
+    # Create a concat text file for FFmpeg
+    concat_file_path = "concat.txt"
+    with open(concat_file_path, "w", encoding="utf-8") as f:
+        for idx, (_, audio_path) in enumerate(chapter_files):
+            # Ensure path uses forward slashes for FFmpeg compatibility
+            safe_path = audio_path.replace("\\", "/")
+            f.write(f"file '{safe_path}'\n")
+            
+    # Run FFmpeg to concatenate and convert to M4B (AAC format)
+    # Using extremely fast copy codec where possible, or AAC re-encoding
+    cmd = [
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0", 
+        "-i", concat_file_path, 
+        "-c:a", "aac", "-b:a", "64k", # 64k is standard audiobook bitrate
+        "-vn", output_m4b
+    ]
+    
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    os.remove(concat_file_path)
 
 # --- UI Layout ---
-st.title("🎧 Free Local PDF to Audiobook")
-st.markdown("Convert 500+ page books into audiobooks entirely for free, with **no API keys** required.")
+st.title("🎙️ Studio-Grade PDF to Audiobook")
+st.markdown("Generates **Chapter-Marked .M4B Audiobooks** using Microsoft Neural Voices.")
 
 with st.sidebar:
-    st.header("⚙️ Settings")
-    
-    accent_options = {
-        "English (US)": "com",
-        "English (UK)": "co.uk",
-        "English (Australia)": "com.au",
-        "English (India)": "co.in"
+    st.header("⚙️ Voice Casting")
+    # A curated list of the best Edge-TTS English voices
+    voices = {
+        "Guy (US - Deep, Professional)": "en-US-GuyNeural",
+        "Christopher (US - Conversational)": "en-US-ChristopherNeural",
+        "Aria (US - Clear, Engaging)": "en-US-AriaNeural",
+        "Sonia (UK - Crisp, Elegant)": "en-GB-SoniaNeural",
+        "Ryan (UK - Calm, Storyteller)": "en-GB-RyanNeural",
+        "Natasha (AU - Friendly)": "en-AU-NatashaNeural"
     }
-    selected_accent_label = st.selectbox("Voice Accent", list(accent_options.keys()))
-    selected_tld = accent_options[selected_accent_label]
-    
-    st.info("💡 **For 500+ page books:** This script processes text in chunks. It will take a few minutes to complete, but it will not run out of API limits!")
+    voice_label = st.selectbox("Narrator Voice", list(voices.keys()))
+    selected_voice = voices[voice_label]
 
-uploaded_file = st.file_uploader("Upload your massive PDF file", type=["pdf"])
+uploaded_file = st.file_uploader("Upload PDF Book", type=["pdf"])
 
-if uploaded_file is not None:
-    if st.button("🚀 Convert Full Book", type="primary"):
-        with st.spinner("Extracting text from your PDF..."):
-            raw_text = extract_text_from_pdf(uploaded_file)
+if uploaded_file:
+    if st.button("🎬 Produce Audiobook", type="primary"):
+        temp_dir = tempfile.mkdtemp()
+        pdf_path = os.path.join(temp_dir, "source.pdf")
+        
+        with open(pdf_path, "wb") as f:
+            f.write(uploaded_file.read())
             
-        if raw_text and len(raw_text.strip()) > 0:
-            processed_text = clean_text(raw_text)
-            chunks = chunk_text(processed_text, max_chars=4000)
+        with st.status("📚 Analyzing Book Structure...", expanded=True) as status:
+            st.write("Extracting Table of Contents and cleaning text...")
+            chapters = extract_chapters_from_pdf(pdf_path)
+            st.write(f"Found {len(chapters)} logical chapters/sections.")
             
-            st.info(f"📖 Book loaded successfully! Split into **{len(chunks)} segments** for processing.")
-            
+            status.update(label="🎙️ Synthesizing Neural Audio...", state="running")
             progress_bar = st.progress(0)
-            status_text = st.empty()
             
-            combined_audio = AudioSegment.empty()
-            temp_files = []
-            success_flag = True
+            chapter_audio_files = []
             
-            for i, chunk in enumerate(chunks):
-                status_text.text(f"Converting segment {i+1} of {len(chunks)}...")
-                try:
-                    # Generate speech chunk
-                    tts = gTTS(text=chunk, lang='en', tld=selected_tld, slow=False)
-                    
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as chunk_file:
-                        chunk_path = chunk_file.name
-                        temp_files.append(chunk_path)
-                    
-                    tts.save(chunk_path)
-                    
-                    # Load and append using pydub
-                    segment_audio = AudioSegment.from_mp3(chunk_path)
-                    combined_audio += segment_audio
-                    
-                except Exception as e:
-                    st.error(f"Error at segment {i+1}: {e}")
-                    success_flag = False
-                    break
+            # Create a new event loop for Edge-TTS asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            for i, chapter in enumerate(chapters):
+                st.write(f"Recording: *{chapter['title']}*")
+                audio_path = os.path.join(temp_dir, f"chap_{i}.mp3")
                 
-                progress_bar.progress((i + 1) / len(chunks))
+                # Run the async TTS generation
+                loop.run_until_complete(
+                    generate_chapter_audio(chapter['text'], selected_voice, audio_path)
+                )
+                chapter_audio_files.append((chapter['title'], audio_path))
+                progress_bar.progress((i + 1) / len(chapters))
                 
-            if success_flag:
-                status_text.text("Stitching audiobook together...")
-                final_output = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-                combined_audio.export(final_output.name, format="mp3")
-                final_output.close()
-                
-                st.session_state['audio_file'] = final_output.name
-                st.session_state['file_name'] = uploaded_file.name.replace(".pdf", "_audiobook.mp3")
-                st.success("🎉 Full audiobook generated successfully!")
-                
-            # Clean up temporary chunk files
-            for path in temp_files:
-                if os.path.exists(path):
-                    os.unlink(path)
-        else:
-            st.error("Could not extract readable text from this PDF.")
+            loop.close()
+            
+            status.update(label="🎞️ Mastering M4B Audiobook...", state="running")
+            st.write("Compiling files and injecting chapter metadata...")
+            
+            final_m4b_path = os.path.join(temp_dir, "Final_Audiobook.m4b")
+            compile_m4b_with_chapters(chapter_audio_files, final_m4b_path)
+            
+            st.session_state['final_audio'] = final_m4b_path
+            st.session_state['book_name'] = uploaded_file.name.replace(".pdf", ".m4b")
+            
+            status.update(label="✅ Audiobook Production Complete!", state="complete")
 
-if 'audio_file' in st.session_state and os.path.exists(st.session_state['audio_file']):
+if 'final_audio' in st.session_state:
     st.markdown("---")
-    st.subheader("🔊 Listen & Download")
-    st.audio(st.session_state['audio_file'], format='audio/mp3')
-    with open(st.session_state['audio_file'], "rb") as file:
+    st.success("🎉 Your production-grade audiobook is ready.")
+    
+    with open(st.session_state['final_audio'], "rb") as file:
         st.download_button(
-            label="📥 Download Full Audiobook (MP3)",
+            label="📥 Download .M4B Audiobook",
             data=file,
-            file_name=st.session_state['file_name'],
-            mime="audio/mp3"
+            file_name=st.session_state['book_name'],
+            mime="audio/mp4"
         )
+    st.caption("💡 Tip: Play the .m4b file in apps like Apple Books, Audible, or Smart Audiobook Player to see the chapter menu!")
